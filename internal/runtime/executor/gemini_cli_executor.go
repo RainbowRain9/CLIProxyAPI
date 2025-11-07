@@ -168,7 +168,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 
 		lastStatus = httpResp.StatusCode
 		lastBody = append([]byte(nil), data...)
-		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, string(data))
+		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		if httpResp.StatusCode == 429 {
 			if idx+1 < len(models) {
 				log.Debugf("gemini cli executor: rate limited, retrying with next model: %s", models[idx+1])
@@ -292,7 +292,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			appendAPIResponseChunk(ctx, e.cfg, data)
 			lastStatus = httpResp.StatusCode
 			lastBody = append([]byte(nil), data...)
-			log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, string(data))
+			log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 			if httpResp.StatusCode == 429 {
 				if idx+1 < len(models) {
 					log.Debugf("gemini cli executor: rate limited, retrying with next model: %s", models[idx+1])
@@ -418,6 +418,7 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 		}
 		payload = deleteJSONField(payload, "project")
 		payload = deleteJSONField(payload, "model")
+		payload = deleteJSONField(payload, "request.safetySettings")
 		payload = util.StripThinkingConfigIfUnsupported(req.Model, payload)
 		payload = fixGeminiCLIImageAspectRatio(attemptModel, payload)
 
@@ -633,11 +634,19 @@ func geminiCLIClientMetadata() string {
 func cliPreviewFallbackOrder(model string) []string {
 	switch model {
 	case "gemini-2.5-pro":
-		return []string{"gemini-2.5-pro-preview-05-06", "gemini-2.5-pro-preview-06-05"}
+		return []string{
+			// "gemini-2.5-pro-preview-05-06",
+			"gemini-2.5-pro-preview-06-05",
+		}
 	case "gemini-2.5-flash":
-		return []string{"gemini-2.5-flash-preview-04-17", "gemini-2.5-flash-preview-05-20"}
+		return []string{
+			// "gemini-2.5-flash-preview-04-17",
+			// "gemini-2.5-flash-preview-05-20",
+		}
 	case "gemini-2.5-flash-lite":
-		return []string{"gemini-2.5-flash-lite-preview-06-17"}
+		return []string{
+			// "gemini-2.5-flash-lite-preview-06-17",
+		}
 	default:
 		return nil
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -142,17 +143,11 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				}
 
 				functionResponse, _ = sjson.Set(functionResponse, "functionResponse.name", functionName)
-				// Also set response.name to align with docs/convert-2.md
-				functionResponse, _ = sjson.Set(functionResponse, "functionResponse.response.name", functionName)
 
 				// Parse output JSON string and set as response content
 				if output != "" {
 					outputResult := gjson.Parse(output)
-					if outputResult.IsObject() {
-						functionResponse, _ = sjson.SetRaw(functionResponse, "functionResponse.response.content", outputResult.String())
-					} else {
-						functionResponse, _ = sjson.Set(functionResponse, "functionResponse.response.content", output)
-					}
+					functionResponse, _ = sjson.Set(functionResponse, "functionResponse.response.result", outputResult.Raw)
 				}
 
 				functionContent, _ = sjson.SetRaw(functionContent, "parts.-1", functionResponse)
@@ -291,5 +286,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 			}
 		}
 	}
-	return []byte(out)
+	result := []byte(out)
+	result = common.AttachDefaultSafetySettings(result, "safetySettings")
+	return result
 }
