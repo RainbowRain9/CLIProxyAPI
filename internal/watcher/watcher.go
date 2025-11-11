@@ -41,24 +41,26 @@ type authDirProvider interface {
 
 // Watcher manages file watching for configuration and authentication files
 type Watcher struct {
-	configPath      string
-	authDir         string
-	config          *config.Config
-	clientsMutex    sync.RWMutex
-	reloadCallback  func(*config.Config)
-	watcher         *fsnotify.Watcher
-	lastAuthHashes  map[string]string
-	lastConfigHash  string
-	authQueue       chan<- AuthUpdate
-	currentAuths    map[string]*coreauth.Auth
-	dispatchMu      sync.Mutex
-	dispatchCond    *sync.Cond
-	pendingUpdates  map[string]AuthUpdate
-	pendingOrder    []string
-	dispatchCancel  context.CancelFunc
-	storePersister  storePersister
-	mirroredAuthDir string
-	oldConfigYaml   []byte
+	configPath        string
+	authDir           string
+	config            *config.Config
+	clientsMutex      sync.RWMutex
+	configReloadMu    sync.Mutex
+	configReloadTimer *time.Timer
+	reloadCallback    func(*config.Config)
+	watcher           *fsnotify.Watcher
+	lastAuthHashes    map[string]string
+	lastConfigHash    string
+	authQueue         chan<- AuthUpdate
+	currentAuths      map[string]*coreauth.Auth
+	dispatchMu        sync.Mutex
+	dispatchCond      *sync.Cond
+	pendingUpdates    map[string]AuthUpdate
+	pendingOrder      []string
+	dispatchCancel    context.CancelFunc
+	storePersister    storePersister
+	mirroredAuthDir   string
+	oldConfigYaml     []byte
 }
 
 type stableIDGenerator struct {
@@ -113,7 +115,8 @@ type AuthUpdate struct {
 const (
 	// replaceCheckDelay is a short delay to allow atomic replace (rename) to settle
 	// before deciding whether a Remove event indicates a real deletion.
-	replaceCheckDelay = 50 * time.Millisecond
+	replaceCheckDelay    = 50 * time.Millisecond
+	configReloadDebounce = 150 * time.Millisecond
 )
 
 // NewWatcher creates a new file watcher instance
@@ -172,7 +175,17 @@ func (w *Watcher) Start(ctx context.Context) error {
 // Stop stops the file watcher
 func (w *Watcher) Stop() error {
 	w.stopDispatch()
+	w.stopConfigReloadTimer()
 	return w.watcher.Close()
+}
+
+func (w *Watcher) stopConfigReloadTimer() {
+	w.configReloadMu.Lock()
+	if w.configReloadTimer != nil {
+		w.configReloadTimer.Stop()
+		w.configReloadTimer = nil
+	}
+	w.configReloadMu.Unlock()
 }
 
 // SetConfig updates the current configuration
@@ -476,40 +489,7 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	// Handle config file changes
 	if isConfigEvent {
 		log.Debugf("config file change details - operation: %s, timestamp: %s", event.Op.String(), now.Format("2006-01-02 15:04:05.000"))
-		data, err := os.ReadFile(w.configPath)
-		if err != nil {
-			log.Errorf("failed to read config file for hash check: %v", err)
-			return
-		}
-		if len(data) == 0 {
-			log.Debugf("ignoring empty config file write event")
-			return
-		}
-		sum := sha256.Sum256(data)
-		newHash := hex.EncodeToString(sum[:])
-
-		w.clientsMutex.RLock()
-		currentHash := w.lastConfigHash
-		w.clientsMutex.RUnlock()
-
-		if currentHash != "" && currentHash == newHash {
-			log.Debugf("config file content unchanged (hash match), skipping reload")
-			return
-		}
-		fmt.Printf("config file changed, reloading: %s\n", w.configPath)
-		if w.reloadConfig() {
-			finalHash := newHash
-			if updatedData, errRead := os.ReadFile(w.configPath); errRead == nil && len(updatedData) > 0 {
-				sumUpdated := sha256.Sum256(updatedData)
-				finalHash = hex.EncodeToString(sumUpdated[:])
-			} else if errRead != nil {
-				log.WithError(errRead).Debug("failed to compute updated config hash after reload")
-			}
-			w.clientsMutex.Lock()
-			w.lastConfigHash = finalHash
-			w.clientsMutex.Unlock()
-			w.persistConfigAsync()
-		}
+		w.scheduleConfigReload()
 		return
 	}
 
@@ -527,6 +507,57 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 			return
 		}
 		w.removeClient(event.Name)
+	}
+}
+
+func (w *Watcher) scheduleConfigReload() {
+	w.configReloadMu.Lock()
+	defer w.configReloadMu.Unlock()
+	if w.configReloadTimer != nil {
+		w.configReloadTimer.Stop()
+	}
+	w.configReloadTimer = time.AfterFunc(configReloadDebounce, func() {
+		w.configReloadMu.Lock()
+		w.configReloadTimer = nil
+		w.configReloadMu.Unlock()
+		w.reloadConfigIfChanged()
+	})
+}
+
+func (w *Watcher) reloadConfigIfChanged() {
+	data, err := os.ReadFile(w.configPath)
+	if err != nil {
+		log.Errorf("failed to read config file for hash check: %v", err)
+		return
+	}
+	if len(data) == 0 {
+		log.Debugf("ignoring empty config file write event")
+		return
+	}
+	sum := sha256.Sum256(data)
+	newHash := hex.EncodeToString(sum[:])
+
+	w.clientsMutex.RLock()
+	currentHash := w.lastConfigHash
+	w.clientsMutex.RUnlock()
+
+	if currentHash != "" && currentHash == newHash {
+		log.Debugf("config file content unchanged (hash match), skipping reload")
+		return
+	}
+	fmt.Printf("config file changed, reloading: %s\n", w.configPath)
+	if w.reloadConfig() {
+		finalHash := newHash
+		if updatedData, errRead := os.ReadFile(w.configPath); errRead == nil && len(updatedData) > 0 {
+			sumUpdated := sha256.Sum256(updatedData)
+			finalHash = hex.EncodeToString(sumUpdated[:])
+		} else if errRead != nil {
+			log.WithError(errRead).Debug("failed to compute updated config hash after reload")
+		}
+		w.clientsMutex.Lock()
+		w.lastConfigHash = finalHash
+		w.clientsMutex.Unlock()
+		w.persistConfigAsync()
 	}
 }
 
@@ -762,16 +793,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 			if base != "" {
 				attrs["base_url"] = base
 			}
-			if len(entry.Headers) > 0 {
-				for hk, hv := range entry.Headers {
-					key := strings.TrimSpace(hk)
-					val := strings.TrimSpace(hv)
-					if key == "" || val == "" {
-						continue
-					}
-					attrs["header:"+key] = val
-				}
-			}
+			addConfigHeadersToAttrs(entry.Headers, attrs)
 			a := &coreauth.Auth{
 				ID:         id,
 				Provider:   "gemini",
@@ -803,6 +825,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 			if hash := computeClaudeModelsHash(ck.Models); hash != "" {
 				attrs["models_hash"] = hash
 			}
+			addConfigHeadersToAttrs(ck.Headers, attrs)
 			proxyURL := strings.TrimSpace(ck.ProxyURL)
 			a := &coreauth.Auth{
 				ID:         id,
@@ -831,6 +854,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 			if ck.BaseURL != "" {
 				attrs["base_url"] = ck.BaseURL
 			}
+			addConfigHeadersToAttrs(ck.Headers, attrs)
 			proxyURL := strings.TrimSpace(ck.ProxyURL)
 			a := &coreauth.Auth{
 				ID:         id,
@@ -873,6 +897,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 					if hash := computeOpenAICompatModelsHash(compat.Models); hash != "" {
 						attrs["models_hash"] = hash
 					}
+					addConfigHeadersToAttrs(compat.Headers, attrs)
 					a := &coreauth.Auth{
 						ID:         id,
 						Provider:   providerName,
@@ -905,6 +930,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 					if hash := computeOpenAICompatModelsHash(compat.Models); hash != "" {
 						attrs["models_hash"] = hash
 					}
+					addConfigHeadersToAttrs(compat.Headers, attrs)
 					a := &coreauth.Auth{
 						ID:         id,
 						Provider:   providerName,
@@ -930,6 +956,7 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 				if hash := computeOpenAICompatModelsHash(compat.Models); hash != "" {
 					attrs["models_hash"] = hash
 				}
+				addConfigHeadersToAttrs(compat.Headers, attrs)
 				a := &coreauth.Auth{
 					ID:         id,
 					Provider:   providerName,
@@ -1131,12 +1158,15 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	newKeyCount := countAPIKeys(newEntry)
 	oldModelCount := countOpenAIModels(oldEntry.Models)
 	newModelCount := countOpenAIModels(newEntry.Models)
-	details := make([]string, 0, 2)
+	details := make([]string, 0, 3)
 	if oldKeyCount != newKeyCount {
 		details = append(details, fmt.Sprintf("api-keys %d -> %d", oldKeyCount, newKeyCount))
 	}
 	if oldModelCount != newModelCount {
 		details = append(details, fmt.Sprintf("models %d -> %d", oldModelCount, newModelCount))
+	}
+	if !equalStringMap(oldEntry.Headers, newEntry.Headers) {
+		details = append(details, "headers updated")
 	}
 	if len(details) == 0 {
 		return ""
@@ -1303,6 +1333,9 @@ func buildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("claude[%d].api-key: updated", i))
 			}
+			if !equalStringMap(o.Headers, n.Headers) {
+				changes = append(changes, fmt.Sprintf("claude[%d].headers: updated", i))
+			}
 		}
 	}
 
@@ -1324,6 +1357,9 @@ func buildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("codex[%d].api-key: updated", i))
+			}
+			if !equalStringMap(o.Headers, n.Headers) {
+				changes = append(changes, fmt.Sprintf("codex[%d].headers: updated", i))
 			}
 		}
 	}
@@ -1355,6 +1391,20 @@ func buildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	}
 
 	return changes
+}
+
+func addConfigHeadersToAttrs(headers map[string]string, attrs map[string]string) {
+	if len(headers) == 0 || attrs == nil {
+		return
+	}
+	for hk, hv := range headers {
+		key := strings.TrimSpace(hk)
+		val := strings.TrimSpace(hv)
+		if key == "" || val == "" {
+			continue
+		}
+		attrs["header:"+key] = val
+	}
 }
 
 func trimStrings(in []string) []string {
